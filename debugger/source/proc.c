@@ -731,7 +731,7 @@ int proc_scan_handle(int fd, struct cmd_packet *packet) {
        uprintf("[SCAN] Thread nr.%u is a go.", i);
     }
     for (int32_t i = 0; i < 10; i++)
-       scePthreadJoin(&threads[i], NULL);        
+       scePthreadJoin(threads[i], NULL);        
 
     uprintf("[SCAN] All threads have returned, scan is complete.");
 
