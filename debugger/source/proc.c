@@ -662,6 +662,7 @@ void *proc_scan_thread(void *arg) {
     }
     free(scanBuffer);
     uprintf("[SCAN] Thread nr.%d is finished with %u results found.", pArgs->threadId, numResults);
+    return NULL;
 }
 
 int proc_scan_handle(int fd, struct cmd_packet *packet) {
