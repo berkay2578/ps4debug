@@ -320,7 +320,6 @@ size_t proc_scan_getSizeOfValueType(cmd_proc_scan_valuetype valType) {
           return NULL;
     }
 }
-
 bool proc_scan_compareValues(cmd_proc_scan_comparetype cmpType, cmd_proc_scan_valuetype valType, size_t valTypeLength,
                                  unsigned char *pScanValue, unsigned char *pMemoryValue, unsigned char *pExtraValue) {
     switch (cmpType) {
@@ -627,30 +626,63 @@ bool proc_scan_compareValues(cmd_proc_scan_comparetype cmpType, cmd_proc_scan_va
     }
     return false;
 }
+typedef struct scanThreadArgs {
+   int32_t fd;
+   int32_t threadId;
+   struct cmd_proc_scan_packet *pPacket;
+   size_t valueLength;
+   unsigned char *arrValues;
+   unsigned char *pExtraValue;
+   struct proc_vm_map_entry *arrMaps;
+   int32_t mapStartIndex, mapEndIndex;
+} scanThreadArgs;
+void *proc_scan_thread(void *arg) {
+    scanThreadArgs *pArgs = (scanThreadArgs *)arg;
+    unsigned char *scanBuffer = (unsigned char *)pfmalloc(PAGE_SIZE);
+
+    uint64_t numResults = 0;
+    for (int32_t i = pArgs->mapStartIndex; i < pArgs->mapEndIndex; i++) {
+       if ((pArgs->arrMaps[i].prot & PROT_READ) != PROT_READ)
+            continue;
+
+       uint64_t sectionStartAddr = pArgs->arrMaps[i].start;
+       size_t sectionLen = pArgs->arrMaps[i].end - sectionStartAddr;
+       // scan
+       for (uint64_t j = 0; j < sectionLen; j += pArgs->valueLength) {
+            if (j == 0 || !(j % PAGE_SIZE))
+                sys_proc_rw(pArgs->pPacket->pid, sectionStartAddr, scanBuffer, PAGE_SIZE, 0);
+
+            uint64_t scanOffset = j % PAGE_SIZE;
+            uint64_t curAddress = sectionStartAddr + j;
+            if (proc_scan_compareValues(pArgs->pPacket->compareType, pArgs->pPacket->valueType, pArgs->valueLength, pArgs->arrValues, scanBuffer + scanOffset, pArgs->pExtraValue)) {
+                net_send_data(pArgs->fd, &curAddress, sizeof(uint64_t));
+                numResults++;
+            }
+       }
+    }
+    free(scanBuffer);
+    uprintf("[SCAN] Thread nr.%d is finished with %u results found.", pArgs->threadId, numResults);
+}
 
 int proc_scan_handle(int fd, struct cmd_packet *packet) {
     struct cmd_proc_scan_packet *sp = (struct cmd_proc_scan_packet *)packet->data;
-
-    if(!sp) {
-        net_send_status(fd, CMD_DATA_NULL);
+    if (!sp) {
+       net_send_status(fd, CMD_DATA_NULL);
        return 1;
     }
 
     // get and set data
     size_t valueLength = proc_scan_getSizeOfValueType(sp->valueType);
-    if (!valueLength) {
+    if (!valueLength)
        valueLength = sp->lenData;
-    }
 
     unsigned char *data = (unsigned char *)pfmalloc(sp->lenData);
     if (!data) {
        net_send_status(fd, CMD_DATA_NULL);
        return 1;
     }
-    
-    net_send_status(fd, CMD_SUCCESS);
-
-    net_recv_data(fd, data, sp->lenData, 1);
+    net_recv_data(fd, data, sp->lenData, 1);    
+    unsigned char *pExtraValue = valueLength == sp->lenData ? NULL : &data[valueLength];    
 
     // query for the process id
     struct sys_proc_vm_map_args args;
@@ -668,51 +700,46 @@ int proc_scan_handle(int fd, struct cmd_packet *packet) {
         net_send_status(fd, CMD_DATA_NULL);
         return 1;
     }
-
     if (sys_proc_cmd(sp->pid, SYS_PROC_VM_MAP, &args)) {
         free(args.maps);
         free(data);
         net_send_status(fd, CMD_ERROR);
         return 1;
     }
-
     net_send_status(fd, CMD_SUCCESS);
 
-    uprintf("scan start");
+    uprintf("[SCAN] Creating threads.");
 
-    unsigned char *pExtraValue = valueLength == sp->lenData ? NULL : &data[valueLength];
-    unsigned char *scanBuffer = (unsigned char *)pfmalloc(PAGE_SIZE);
-    for (size_t i = 0; i < args.num; i++) {
-       if ((args.maps[i].prot & PROT_READ) != PROT_READ) {
-            continue;
-       }
-
-       uint64_t sectionStartAddr = args.maps[i].start;
-       size_t sectionLen = args.maps[i].end - sectionStartAddr;
-
-       // scan
-       for (uint64_t j = 0; j < sectionLen; j += valueLength) {
-            if(j == 0 || !(j % PAGE_SIZE)) {
-                sys_proc_rw(sp->pid, sectionStartAddr, scanBuffer, PAGE_SIZE, 0);
-            }
-
-            uint64_t scanOffset = j % PAGE_SIZE;
-            uint64_t curAddress = sectionStartAddr + j;
-            if (proc_scan_compareValues(sp->compareType, sp->valueType, valueLength, data, scanBuffer + scanOffset, pExtraValue)) {
-                net_send_data(fd, &curAddress, sizeof(uint64_t));
-            }
-       }
+    ScePthread threads[10];
+    size_t numMaps = args.num;
+    int32_t numMapStep = (args.num / 10.0f) + 0.5f;
+    int32_t lastMapStartIndex = 0;
+    for (int32_t i = 0; i < 10; i++) {
+       scanThreadArgs threadArgs = {
+          fd, i, sp,
+          valueLength,
+          data,
+          pExtraValue,
+          args.maps,
+          lastMapStartIndex,
+          i == 9 ? numMaps : numMapStep
+       };
+       scePthreadCreate(&threads[i], NULL, &proc_scan_thread, &threadArgs, "ScanThread");
+       numMaps -= numMapStep;
+       lastMapStartIndex += numMapStep;
+       uprintf("[SCAN] Thread nr.%u will scan from section index %d to %d", i, threadArgs.mapStartIndex, threadArgs.mapEndIndex);
+       uprintf("[SCAN] Thread nr.%u is a go.", i);
     }
+    for (int32_t i = 0; i < 10; i++)
+       scePthreadJoin(&threads[i], NULL);        
 
-    uprintf("scan done");
+    uprintf("[SCAN] All threads have returned, scan is complete.");
 
     uint64_t endflag = 0xFFFFFFFFFFFFFFFF;
     net_send_data(fd, &endflag, sizeof(uint64_t));
 
-    free(scanBuffer);
     free(args.maps);
     free(data);
-
     return 0;
 }
 
